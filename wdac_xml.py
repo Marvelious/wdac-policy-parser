@@ -1,5 +1,8 @@
 """
 WDAC XML Serializer — converts parsed PolicyData to Microsoft SiPolicy XML.
+
+Output matches the format produced by mattifestation/WDACTools
+ConvertTo-WDACCodeIntegrityPolicy PowerShell cmdlet.
 """
 
 import xml.etree.ElementTree as ET
@@ -35,13 +38,6 @@ OPTION_FLAG_NAMES = {
     0x08000000: "Enabled:Managed Installer",
     0x10000000: "Enabled:Update Policy No Reboot",
     0x20000000: "Enabled:Conditional Windows Lockdown Policy",
-}
-
-HASH_ALGO_MAP = {
-    0x8004: "SHA1",
-    0x800C: "SHA256",
-    0x800D: "SHA384",
-    0x800E: "SHA512",
 }
 
 
@@ -84,30 +80,34 @@ def _guid_str(guid) -> str:
     return "{" + str(guid).upper() + "}"
 
 
-def _version_str(ver: str) -> str:
-    """Ensure version string is present; default to 0.0.0.0."""
-    return ver if ver and ver != "0.0.0.0" else "0.0.0.0"
-
-
 def _hash_hex(data: bytes) -> str:
     """Convert hash bytes to uppercase hex string."""
     return data.hex().upper() if data else ""
+
+
+def _policy_type_str(policy: "PolicyData") -> str:
+    """Determine PolicyType attribute value: 'Base Policy' or 'Supplemental Policy'."""
+    if policy.policy_id and policy.base_policy_id:
+        if str(policy.policy_id) != str(policy.base_policy_id):
+            return "Supplemental Policy"
+    return "Base Policy"
 
 
 # ── Build XML tree ───────────────────────────────────────────────────────────
 
 def serialize_policy(policy: "PolicyData") -> str:
     """Serialize PolicyData to Microsoft SiPolicy XML string."""
-    root = ET.Element("SiPolicy", {
-        "xmlns": "urn:schemas-microsoft-com:sipolicy",
-        "PolicyType": policy.policy_type_name,
-    })
+    root = ET.Element("SiPolicy")
+    # Attributes set manually for correct order
+    root.set("xmlns:xsd", "http://www.w3.org/2001/XMLSchema")
+    root.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
+    root.set("PolicyType", _policy_type_str(policy))
+    root.set("xmlns", "urn:schemas-microsoft-com:sipolicy")
 
     # VersionEx
     ET.SubElement(root, "VersionEx").text = policy.version_ex
 
-    # PolicyTypeID / PlatformID
-    ET.SubElement(root, "PolicyTypeID").text = _guid_str(policy.policy_type_id)
+    # PlatformID (no PolicyTypeID — it's in the PolicyType attribute)
     ET.SubElement(root, "PlatformID").text = _guid_str(policy.platform_id)
 
     # PolicyID / BasePolicyID (V6+)
@@ -123,14 +123,13 @@ def serialize_policy(policy: "PolicyData") -> str:
             rule_el = ET.SubElement(rules_el, "Rule")
             ET.SubElement(rule_el, "Option").text = flag_name
 
-    # EKUs
+    # EKUs — attribute order: ID, Value, FriendlyName
     ekus_el = ET.SubElement(root, "EKUs")
     for i, eku in enumerate(policy.ekus):
-        eku_el = ET.SubElement(ekus_el, "EKU", {
-            "ID": _eku_id(i),
-            "FriendlyName": eku.friendly_name,
-            "Value": _encode_eku_value(eku.raw_bytes),
-        })
+        eku_el = ET.SubElement(ekus_el, "EKU")
+        eku_el.set("ID", _eku_id(i))
+        eku_el.set("Value", _encode_eku_value(eku.raw_bytes))
+        eku_el.set("FriendlyName", eku.friendly_name)
 
     # FileRules
     file_rules_el = ET.SubElement(root, "FileRules")
@@ -144,27 +143,33 @@ def serialize_policy(policy: "PolicyData") -> str:
 
     # SigningScenarios
     scenarios_el = ET.SubElement(root, "SigningScenarios")
+    # Reset counters per serialize call
+    driver_count = [0]
+    windows_count = [0]
     for scenario in policy.signing_scenarios:
-        _build_scenario_element(scenarios_el, scenario, policy)
+        _build_scenario_element(scenarios_el, scenario, policy, driver_count, windows_count)
 
-    # UpdatePolicySigners
-    ups_el = ET.SubElement(root, "UpdatePolicySigners")
-    for idx in policy.update_policy_signers:
-        ET.SubElement(ups_el, "UpdatePolicySigner", {"SignerId": _signer_id(idx)})
+    # UpdatePolicySigners — only if non-empty
+    if policy.update_policy_signers:
+        ups_el = ET.SubElement(root, "UpdatePolicySigners")
+        for idx in policy.update_policy_signers:
+            ET.SubElement(ups_el, "UpdatePolicySigner", {"SignerId": _signer_id(idx)})
 
-    # CiSigners
-    ci_el = ET.SubElement(root, "CiSigners")
-    for idx in policy.ci_signers:
-        ET.SubElement(ci_el, "CiSigner", {"SignerId": _signer_id(idx)})
+    # CiSigners — only if non-empty
+    if policy.ci_signers:
+        ci_el = ET.SubElement(root, "CiSigners")
+        for idx in policy.ci_signers:
+            ET.SubElement(ci_el, "CiSigner", {"SignerId": _signer_id(idx)})
 
-    # SupplementalPolicySigners (V6+)
+    # SupplementalPolicySigners (V6+) — only if non-empty
     if policy.supplemental_policy_signers:
         sps_el = ET.SubElement(root, "SupplementalPolicySigners")
         for idx in policy.supplemental_policy_signers:
             ET.SubElement(sps_el, "SupplementalPolicySigner", {"SignerId": _signer_id(idx)})
 
-    # HvciOptions
-    ET.SubElement(root, "HvciOptions").text = str(policy.hvci_options)
+    # HvciOptions — only if non-zero
+    if policy.hvci_options:
+        ET.SubElement(root, "HvciOptions").text = str(policy.hvci_options)
 
     # Settings (Secure Settings)
     if policy.secure_settings:
@@ -174,72 +179,69 @@ def serialize_policy(policy: "PolicyData") -> str:
 
     # Pretty-print
     ET.indent(root, space="  ")
-    xml_decl = '<?xml version="1.0" encoding="utf-8"?>\n'
+    xml_decl = '<?xml version="1.0"?>\n'
     return xml_decl + ET.tostring(root, encoding="unicode")
 
 
 # ── Element builders ─────────────────────────────────────────────────────────
 
 def _build_file_rule_element(parent: ET.Element, rule: "FileRule", idx: int):
-    """Build a single FileRule XML element (Allow/Deny/FileAttrib)."""
+    """Build a single FileRule XML element (Allow/Deny/FileAttrib).
+
+    Hash-only Deny/Allow rules: <Deny ID="..." Hash="..." />
+    FileAttrib/named rules: <FileAttrib ID="..." FileName="..." MinimumFileVersion="..." />
+    """
     tag_map = {0: "Deny", 1: "Allow", 2: "FileAttrib"}
     tag = tag_map.get(rule.rule_type, "Allow")
     rule_id = _file_rule_id(rule, idx)
 
-    attrs = {"ID": rule_id, "FriendlyName": rule.file_name or ""}
-
-    if rule.file_name:
-        attrs["FileName"] = rule.file_name
-    if rule.min_version and rule.min_version != "0.0.0.0":
-        attrs["MinimumFileVersion"] = rule.min_version
-    if rule.max_version and rule.max_version != "0.0.0.0":
-        attrs["MaximumFileVersion"] = rule.max_version
-    if rule.internal_name:
-        attrs["InternalName"] = rule.internal_name
-    if rule.file_description:
-        attrs["FileDescription"] = rule.file_description
-    if rule.product_name:
-        attrs["ProductName"] = rule.product_name
-    if rule.package_family_name:
-        attrs["PackageFamilyName"] = rule.package_family_name
-    if rule.package_version and rule.package_version != "0.0.0.0":
-        attrs["PackageVersion"] = rule.package_version
-    if rule.file_path:
-        attrs["FilePath"] = rule.file_path
-    if rule.app_ids:
-        attrs["AppIDs"] = rule.app_ids
-
-    el = ET.SubElement(parent, tag, attrs)
-
-    # Hash element
-    if rule.hash_value:
-        hash_el = ET.SubElement(el, "Hash")
-        hash_el.text = _hash_hex(rule.hash_value)
+    el = ET.SubElement(parent, tag)
+    # For FileAttrib/named rules: ID, FileName, versions
+    # For hash-only rules: ID, Hash
+    if rule.rule_type == 2 or rule.file_name:
+        # FileAttrib or named rule — no FriendlyName, use FileName + versions
+        el.set("ID", rule_id)
+        if rule.file_name:
+            el.set("FileName", rule.file_name)
+        if rule.min_version and rule.min_version != "0.0.0.0":
+            el.set("MinimumFileVersion", rule.min_version)
+        if rule.max_version and rule.max_version != "0.0.0.0":
+            el.set("MaximumFileVersion", rule.max_version)
+        if rule.internal_name:
+            el.set("InternalName", rule.internal_name)
+        if rule.file_description:
+            el.set("FileDescription", rule.file_description)
+        if rule.product_name:
+            el.set("ProductName", rule.product_name)
+        if rule.package_family_name:
+            el.set("PackageFamilyName", rule.package_family_name)
+        if rule.package_version and rule.package_version != "0.0.0.0":
+            el.set("PackageVersion", rule.package_version)
+        if rule.file_path:
+            el.set("FilePath", rule.file_path)
+        if rule.app_ids:
+            el.set("AppIDs", rule.app_ids)
+        if rule.hash_value:
+            el.set("Hash", _hash_hex(rule.hash_value))
+    else:
+        # Hash-only Deny/Allow rule — just ID + Hash
+        el.set("ID", rule_id)
+        if rule.hash_value:
+            el.set("Hash", _hash_hex(rule.hash_value))
 
     return el
 
 
 def _build_signer_element(parent: ET.Element, signer: "Signer", idx: int, policy: "PolicyData"):
-    """Build a single Signer XML element."""
-    signer_el = ET.SubElement(parent, "Signer", {
-        "ID": _signer_id(idx),
-        "Name": signer.cert_issuer or f"Signer {idx}",
-    })
+    """Build a single Signer XML element. Attribute order: Name, ID."""
+    signer_el = ET.SubElement(parent, "Signer")
+    signer_el.set("Name", signer.cert_issuer or f"Signer {idx + 1}")
+    signer_el.set("ID", _signer_id(idx))
 
     # CertRoot
     if signer.cert_root_type == 1:
         # WellKnown
         well_known_val = signer.cert_root[0] if signer.cert_root else 0
-        well_known_map = {
-            1: "Microsoft Authenticode(tm) Root Authority",
-            2: "Microsoft Root Authority",
-            3: "Microsoft Root Certificate Authority",
-            4: "Microsoft Root Certificate Authority 2010",
-            5: "Microsoft Root Certificate Authority 2011",
-            6: "Microsoft Testing Root Certificate Authority 2010",
-            7: "Microsoft Development Root Certificate Authority 2014",
-            8: "Microsoft Standard Root Certificate Authority 2011",
-        }
         ET.SubElement(signer_el, "CertRoot", {
             "Type": "Wellknown",
             "Value": f"{well_known_val:02X}",
@@ -279,37 +281,25 @@ def _build_signer_element(parent: ET.Element, signer: "Signer", idx: int, policy
     return signer_el
 
 
-_driver_scenario_count = 0
-_windows_scenario_count = 0
-
-def _scenario_id(scenario) -> str:
+def _scenario_id(scenario, driver_count: list, windows_count: list) -> str:
     """Generate scenario ID matching PowerShell format."""
-    global _driver_scenario_count, _windows_scenario_count
     if scenario.value == 131:
-        _driver_scenario_count += 1
-        return f"ID_SIGNINGSCENARIO_DRIVERS_{_driver_scenario_count:X}"
+        driver_count[0] += 1
+        return f"ID_SIGNINGSCENARIO_DRIVERS_{driver_count[0]:X}"
     elif scenario.value == 12:
-        _windows_scenario_count += 1
-        if _windows_scenario_count == 1:
+        windows_count[0] += 1
+        if windows_count[0] == 1:
             return "ID_SIGNINGSCENARIO_WINDOWS"
-        return f"ID_SIGNINGSCENARIO_WINDOWS_{_windows_scenario_count:X}"
+        return f"ID_SIGNINGSCENARIO_WINDOWS_{windows_count[0]:X}"
     return f"ID_SIGNINGSCENARIO_S_{scenario.value:04X}"
 
 
-def _build_scenario_element(parent: ET.Element, scenario: "SigningScenario", policy: "PolicyData"):
-    """Build a SigningScenario XML element."""
-    scenario_el = ET.SubElement(parent, "SigningScenario", {
-        "Value": str(scenario.value),
-        "ID": _scenario_id(scenario),
-    })
-
-    if scenario.inherited:
-        ET.SubElement(scenario_el, "Inherited").text = "true"
-
-    # MinimumHashAlgorithm
-    algo_name = HASH_ALGO_MAP.get(scenario.min_hash_algo, "")
-    if algo_name:
-        ET.SubElement(scenario_el, "MinimumHashAlgorithm").text = algo_name
+def _build_scenario_element(parent: ET.Element, scenario: "SigningScenario",
+                            policy: "PolicyData", driver_count: list, windows_count: list):
+    """Build a SigningScenario XML element. Attribute order: ID, Value."""
+    scenario_el = ET.SubElement(parent, "SigningScenario")
+    scenario_el.set("ID", _scenario_id(scenario, driver_count, windows_count))
+    scenario_el.set("Value", str(scenario.value))
 
     # ProductSigners
     _build_signer_group_element(scenario_el, "ProductSigners", scenario.product_signers, policy)
