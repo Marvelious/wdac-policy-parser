@@ -5,3 +5,8 @@ __pycache__/
 dist/
 build/
 *.xml
+
+# Environment
+.env
+.env.*
+!.env.example
